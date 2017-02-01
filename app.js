@@ -2,9 +2,47 @@ var config = require('config');
 var async = require('async');
 var request = require('request');
 var qs = require('qs');
+var express = require('express')
 var firebase = require('firebase');
+var VK = require('vksdk');
+var path    = require("path");
+var bodyParser = require('body-parser');
 
-var database = new firebase(config.vk.firebaseLink);
+var app = express();
+var dbConfig = {
+  apiKey: config.vk.dbtoken,
+  authDomain: config.vk.authDomain,
+  databaseURL: config.vk.firebaseLink
+};
+
+firebase.initializeApp(dbConfig);
+console.log(firebase.app().name);
+var database = firebase.database().ref();
+
+
+
+
+var vk = new VK({
+   'appId'     : config.vk.appId,
+   'appSecret' : config.vk.appSecret,
+   'language'  : 'ru'
+});
+
+
+app.set('views', __dirname);
+app.use(bodyParser.json());
+
+vk.setSecureRequests(true);
+vk.setVersion('5.62');
+
+
+vk.on('http-error', function(_e) {
+    console.log('http-error: '+ _e);
+});
+
+vk.on('parse-error', function(_e) {
+    console.log("parse-error" + _e);
+});
 
 function getAttachmentsStr(attachments) {
     var attachmentsStr = '';
@@ -27,18 +65,8 @@ function getAttachmentsStr(attachments) {
     return attachmentsStr;
 }
 
-function requestAPI(reqMethod, apiMethod, data, callback) {
-    request({
-        method: reqMethod,
-        timeout: 5000,
-        uri: 'https://api.vk.com/method/' + apiMethod + '?v=5.37&access_token=' + config.vk.token + '&' + qs.stringify(data)
-    }, function(err, res, body) {
-        if (err) {
-            return callback(err);
-        }
-        callback(null, JSON.parse(body));
-    });
-}
+
+
 
 function postsToRepost(postsToAdd) {
 
@@ -69,33 +97,38 @@ function postsToRepost(postsToAdd) {
 }
 
 
-// Get the last added post time 
-requestAPI('GET', 'wall.get', { owner_id : config.vk.targetGroupId, offset : 0, count : 1}, function(err, post) {
 
-    if (err) {
-        console.log('GET ERROR:', err);
-        return;
-    }
 
-    if (!post.response.items.length) {
-        return;
-    }
 
+
+
+
+app.get('/authorize', function(req, res) {
+   //for now has access_token has to be inserted manually
+   var access_token = ''
+   
+   vk.setToken(access_token);
+
+
+   vk.request('wall.get', { owner_id : config.vk.targetGroupId, offset : 0, count : 1}, function(post) {
+
+    console.log('wall.get: ');
+ 
     var lastPostAddTime = post.response.items[0].date;
     console.log(lastPostAddTime);
 
     async.eachSeries(config.vk.pullGroupIds, function(groupId, nextGroup) {
 
         //get set of posts from targeted group that were added after last post from my group (up to 50)
-        requestAPI('GET', 'wall.get', {owner_id : groupId, offset : 1, count : 50}, function(err, posts) {
+        vk.request('wall.get', {owner_id : groupId, offset : 1, count : 50}, function(posts) {
 
-            if (err) {
-                return nextGroup(err);
-            }
 
-            database.child(groupId.toString()).once('value', function (snapshot) {
+
+                console.log('get group id: '+groupId.toString());
+             database.child(groupId.toString()).once('value', function (snapshot) {
 
                 var lastAddedPostTime = 0;
+                console.log('check the last time db was created');
 
                 if (!snapshot.val()) {
                     database.child(groupId).set({lastAddedPostTime : 0});
@@ -107,7 +140,7 @@ requestAPI('GET', 'wall.get', { owner_id : config.vk.targetGroupId, offset : 0, 
                     return post.date > lastAddedPostTime;
                 });
 
-                database.child(groupId).update({lastAddedPostTime : posts.response.items[0].date});
+               database.child(groupId).update({lastAddedPostTime : posts.response.items[0].date});
 
                 if (!postsToAdd.length) {
                     console.log('nothing to add');
@@ -116,6 +149,8 @@ requestAPI('GET', 'wall.get', { owner_id : config.vk.targetGroupId, offset : 0, 
                 }
 
                 console.log('The last post was added at: ' + lastAddedPostTime + ', amount of post is: ' + postsToAdd.length);
+
+
 
                 var numberOfPostsToPost = postsToRepost(postsToAdd);
 
@@ -131,16 +166,16 @@ requestAPI('GET', 'wall.get', { owner_id : config.vk.targetGroupId, offset : 0, 
                         var attachmentsStr = '';
                     }
 
-                    console.log('POST ID:', post.id);
 
-                    requestAPI('POST', 'wall.post', {
-                        owner_id: config.vk.targetGroupId,
-                        from_group: 1,
-                        message: post.text,
-                        attachments: attachmentsStr,
+                    vk.request('wall.post', {
+                        'owner_id': config.vk.targetGroupId,
+                        'from_group': 1,
+                        'message': post.text,
+                        'access_token': access_token,
+                        'attachments': attachmentsStr,
                     }, function(err) {
                         if (err) {
-                            console.log('POST ERROR:', err);
+                            console.log('POST MSG:', err);
                         }
 
                         setTimeout(next, 1000);
@@ -148,7 +183,7 @@ requestAPI('GET', 'wall.get', { owner_id : config.vk.targetGroupId, offset : 0, 
 
                 }, function(err) {
                     if (err) {
-                        console.log('POST ERROR:', err);
+                        console.log('POST MSG:', err);
                         nextGroup(err);
                         return;
                     }
@@ -156,18 +191,27 @@ requestAPI('GET', 'wall.get', { owner_id : config.vk.targetGroupId, offset : 0, 
                     console.log('GROUP DONE!!!');
                     nextGroup();
                 });
-            }, function (err) {
-                console.log(err);
-                process.exit();
             });
         });
-    }, function(err) {
-        if (err) {
-            console.log('GROUP ERROR:', err);
+    }, function(msg) {
+        if (msg) {
+            console.log('Group complete msg:', msg);
             return;
         }
 
-        console.log('GROUPS DONE!!!');
+        console.log('Finished processing groups');
         process.exit();
     }); 
+ });
 });
+
+
+app.get('/index', function(req, res){ 
+    res.sendFile(path.join(__dirname + '/index.html'));
+});
+
+app.get('/', function (req, res) {
+  res.redirect('https://oauth.vk.com/authorize?client_id=5816817&display=page&redirect_uri=https://oauth.vk.com/blank.html&scope=wall,groups,friends,offline&response_type=token&v=5.62');
+});
+
+app.listen(3000);
